@@ -782,6 +782,10 @@ static bool probe(struct platform *p, void *ctx)
 	struct stat statbuf;
 	int rc;
 
+//FIXME: need more tests here	
+#if !defined(__POWERPC__)
+	return false;
+#endif
 	/* we need a device tree */
 	rc = stat("/proc/device-tree", &statbuf);
 	if (rc)
