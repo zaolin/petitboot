@@ -193,6 +193,9 @@ static struct pb_boot_data *boot_editor_prepare_data(
 			boot_editor->widgets.args_sig_file_f);
 		bd->args_sig_file = conditional_prefix(bd, prefix, s);
 	}
+	else {
+		bd->args_sig_file = NULL;
+	}
 
 	return bd;
 }
@@ -508,6 +511,10 @@ static void boot_editor_setup_widgets(struct boot_editor *boot_editor,
 		boot_editor->widgets.args_sig_file_f = widget_new_textbox(set,
 				0, 0, field_size, boot_editor->args_sig_file);
 	}
+	else {
+		boot_editor->widgets.args_sig_file_l = NULL;
+		boot_editor->widgets.args_sig_file_f = NULL;
+	}
 
 	boot_editor->widgets.ok_b = widget_new_button(set, 0, 0, 6,
 					_("OK"), ok_click, boot_editor);
@@ -628,7 +635,7 @@ struct boot_editor *boot_editor_init(struct cui *cui,
 		if (boot_editor->use_signature_files)
 			boot_editor->args_sig_file = bd->args_sig_file;
 		else
-			boot_editor->args_sig_file = "";
+			boot_editor->args_sig_file = talloc_strdup(bd, "");
 		boot_editor_find_device(boot_editor, bd, sysinfo);
 	} else {
 		boot_editor->image = boot_editor->initrd =
