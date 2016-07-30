@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/reboot.h>
 
 #include "log/log.h"
 #include "pb-protocol/pb-protocol.h"
@@ -78,6 +79,15 @@ static void cui_atexit(void)
 	clear();
 	refresh();
 	endwin();
+
+	bool lockdown = false;
+	if (access(LOCKDOWN_FILE, F_OK) != -1)
+		lockdown = true;
+
+	while (lockdown) {
+		sync();
+		reboot(RB_AUTOBOOT);
+	}
 }
 
 /**
@@ -483,6 +493,7 @@ static int cui_boot_option_add(struct device *dev, struct boot_option *opt,
 	cod->bd->initrd = talloc_strdup(cod->bd, opt->initrd_file);
 	cod->bd->dtb = talloc_strdup(cod->bd, opt->dtb_file);
 	cod->bd->args = talloc_strdup(cod->bd, opt->boot_args);
+	cod->bd->args_sig_file = talloc_strdup(cod->bd, opt->args_sig_file);
 
 	/* This disconnects items array from menu. */
 	result = set_menu_items(cui->main->ncm, NULL);
@@ -506,6 +517,7 @@ static int cui_boot_option_add(struct device *dev, struct boot_option *opt,
 	pb_log("   image  '%s'\n", cod->bd->image);
 	pb_log("   initrd '%s'\n", cod->bd->initrd);
 	pb_log("   args   '%s'\n", cod->bd->args);
+	pb_log("   argsig '%s'\n", cod->bd->args_sig_file);
 
 	/* Re-attach the items array. */
 	result = set_menu_items(cui->main->ncm, cui->main->items);
@@ -746,6 +758,9 @@ static struct pmenu *main_menu_init(struct cui *cui)
 	struct pmenu_item *i;
 	struct pmenu *m;
 	int result;
+	bool lockdown = false;
+	if (access(LOCKDOWN_FILE, F_OK) != -1)
+		lockdown = true;
 
 	m = pmenu_init(cui, 7, cui_on_exit);
 	if (!m) {
@@ -789,9 +804,16 @@ static struct pmenu *main_menu_init(struct cui *cui)
 	i->on_execute = menu_add_url_execute;
 	pmenu_item_insert(m, i, 5);
 
-	i = pmenu_item_create(m, _("Exit to shell"));
-	i->on_execute = pmenu_exit_cb;
-	pmenu_item_insert(m, i, 6);
+	if (lockdown) {
+		i = pmenu_item_create(m, _("Reboot"));
+		i->on_execute = pmenu_exit_cb;
+		pmenu_item_insert(m, i, 6);
+	}
+	else {
+		i = pmenu_item_create(m, _("Exit to shell"));
+		i->on_execute = pmenu_exit_cb;
+		pmenu_item_insert(m, i, 6);
+	}
 
 	result = pmenu_setup(m);
 

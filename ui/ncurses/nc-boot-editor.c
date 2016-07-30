@@ -62,6 +62,8 @@ struct boot_editor {
 		struct nc_widget_textbox	*dtb_f;
 		struct nc_widget_label		*args_l;
 		struct nc_widget_textbox	*args_f;
+		struct nc_widget_label		*args_sig_file_l;
+		struct nc_widget_textbox	*args_sig_file_f;
 		struct nc_widget_button		*ok_b;
 		struct nc_widget_button		*help_b;
 		struct nc_widget_button		*cancel_b;
@@ -72,6 +74,9 @@ struct boot_editor {
 	char			*initrd;
 	char			*dtb;
 	char			*args;
+	char			*args_sig_file;
+
+	bool			use_signature_files;
 };
 
 extern const struct help_text boot_editor_help_text;
@@ -182,6 +187,12 @@ static struct pb_boot_data *boot_editor_prepare_data(
 
 	s = widget_textbox_get_value(boot_editor->widgets.args_f);
 	bd->args = *s ? talloc_strdup(bd, s) : NULL;
+
+	if (boot_editor->use_signature_files) {
+		s = widget_textbox_get_value(
+			boot_editor->widgets.args_sig_file_f);
+		bd->args_sig_file = conditional_prefix(bd, prefix, s);
+	}
 
 	return bd;
 }
@@ -302,6 +313,12 @@ static void boot_editor_layout_widgets(struct boot_editor *boot_editor)
 	y += layout_pair(boot_editor, y, boot_editor->widgets.args_l,
 					 boot_editor->widgets.args_f);
 
+	if (boot_editor->use_signature_files) {
+		y += layout_pair(boot_editor, y,
+					boot_editor->widgets.args_sig_file_l,
+					boot_editor->widgets.args_sig_file_f);
+	}
+
 
 	y++;
 	widget_move(widget_button_base(boot_editor->widgets.ok_b), y, 9);
@@ -421,6 +438,11 @@ static void boot_editor_find_device(struct boot_editor *boot_editor,
 	if (bd->dtb && !path_on_device(bd_info, bd->dtb))
 		return;
 
+	if (boot_editor->use_signature_files)
+		if (bd->args_sig_file && !path_on_device(bd_info,
+			bd->args_sig_file))
+			return;
+
 	/* ok, we match; preselect the device option, and remove the common
 	 * prefix */
 	boot_editor->selected_device = bd_info->name;
@@ -430,6 +452,9 @@ static void boot_editor_find_device(struct boot_editor *boot_editor,
 		boot_editor->initrd += len;
 	if (boot_editor->dtb)
 		boot_editor->dtb += len;
+	if (boot_editor->use_signature_files)
+		if (boot_editor->args_sig_file)
+			boot_editor->args_sig_file += len;
 }
 
 static void boot_editor_setup_widgets(struct boot_editor *boot_editor,
@@ -476,6 +501,13 @@ static void boot_editor_setup_widgets(struct boot_editor *boot_editor,
 			_("Boot arguments:"));
 	boot_editor->widgets.args_f = widget_new_textbox(set, 0, 0,
 					field_size, boot_editor->args);
+
+	if (boot_editor->use_signature_files) {
+		boot_editor->widgets.args_sig_file_l = widget_new_label(set,
+				0, 0, _("Argument signature file:"));
+		boot_editor->widgets.args_sig_file_f = widget_new_textbox(set,
+				0, 0, field_size, boot_editor->args_sig_file);
+	}
 
 	boot_editor->widgets.ok_b = widget_new_button(set, 0, 0, 6,
 					_("OK"), ok_click, boot_editor);
@@ -554,6 +586,15 @@ struct boot_editor *boot_editor_init(struct cui *cui,
 	if (!boot_editor)
 		return NULL;
 
+#if defined(HAVE_LIBGPGME)
+	if (access(LOCKDOWN_FILE, F_OK) == -1)
+		boot_editor->use_signature_files = false;
+	else
+		boot_editor->use_signature_files = true;
+#else
+	boot_editor->use_signature_files = false;
+#endif
+
 	talloc_set_destructor(boot_editor, boot_editor_destructor);
 	boot_editor->cui = cui;
 	boot_editor->item = item;
@@ -562,9 +603,10 @@ struct boot_editor *boot_editor_init(struct cui *cui,
 
 	int ncols1 = strncols(_("Device tree:"));
 	int ncols2 = strncols(_("Boot arguments:"));
+	int ncols3 = strncols(_("Argument signature file:"));
 
 	boot_editor->label_x = 1;
-	boot_editor->field_x = 2 + max(ncols1, ncols2);
+	boot_editor->field_x = 2 + max(max(ncols1, ncols2), ncols3);
 
 	nc_scr_init(&boot_editor->scr, pb_boot_editor_sig, 0,
 			cui, boot_editor_process_key,
@@ -583,10 +625,15 @@ struct boot_editor *boot_editor_init(struct cui *cui,
 		boot_editor->initrd = bd->initrd;
 		boot_editor->dtb = bd->dtb;
 		boot_editor->args = bd->args;
+		if (boot_editor->use_signature_files)
+			boot_editor->args_sig_file = bd->args_sig_file;
+		else
+			boot_editor->args_sig_file = "";
 		boot_editor_find_device(boot_editor, bd, sysinfo);
 	} else {
 		boot_editor->image = boot_editor->initrd =
-			boot_editor->dtb = boot_editor->args = "";
+			boot_editor->dtb = boot_editor->args =
+			boot_editor->args_sig_file = "";
 	}
 
 	boot_editor->pad = newpad(

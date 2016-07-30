@@ -20,15 +20,27 @@
 #include <util/util.h>
 #include <i18n/i18n.h>
 
+#if defined(HAVE_LIBGPGME)
+#include <gpgme.h>
+#endif
+
 #include "device-handler.h"
 #include "boot.h"
 #include "paths.h"
 #include "resource.h"
 
+#define MAX_FILENAME_SIZE	8192
+#define FILE_XFER_BUFFER_SIZE	8192
+
 static const char *boot_hook_dir = PKG_SYSCONF_DIR "/boot.d";
 enum {
 	BOOT_HOOK_EXIT_OK	= 0,
 	BOOT_HOOK_EXIT_UPDATE	= 2,
+};
+
+enum {
+	KEXEC_LOAD_SIG_SETUP_INVALID = 253,
+	KEXEC_LOAD_SIGNATURE_FAILURE = 254,
 };
 
 struct boot_task {
@@ -43,7 +55,207 @@ struct boot_task {
 	void *status_arg;
 	bool dry_run;
 	bool cancelled;
+	bool verify_signature;
+	struct load_url_result *image_signature;
+	struct load_url_result *initrd_signature;
+	struct load_url_result *dtb_signature;
+	struct load_url_result *cmdline_signature;
+	const char *local_image_signature;
+	const char *local_initrd_signature;
+	const char *local_dtb_signature;
+	const char *local_cmdline_signature;
 };
+
+static int copy_file_to_destination(const char * source_file,
+	char * destination_file, int max_dest_filename_size) {
+	int result = 0;
+	char template[21] = "/tmp/petitbootXXXXXX";
+	FILE *source_handle = fopen(source_file, "r");
+	int destination_fd = mkstemp(template);
+	FILE *destination_handle = fdopen(destination_fd, "w");
+	if (!source_handle || !(destination_handle)) {
+		// handle open error
+		pb_log("%s: failed: unable to open source file '%s'\n",
+			__func__, source_file);
+		result = 1;
+	}
+
+	size_t l1;
+	unsigned char buffer[FILE_XFER_BUFFER_SIZE];
+
+	/* Copy data */
+	while ((l1 = fread(buffer, 1, sizeof buffer, source_handle)) > 0) {
+		size_t l2 = fwrite(buffer, 1, l1, destination_handle);
+		if (l2 < l1) {
+			if (ferror(destination_handle)) {
+				/* General error */
+				result = 1;
+				pb_log("%s: failed: unknown fault\n", __func__);
+			}
+			else {
+				/* No space on destination device */
+				result = 2;
+				pb_log("%s: failed: temporary storage full\n",
+					__func__);
+			}
+		}
+	}
+
+	if (result) {
+		destination_file[0] = '\0';
+	}
+	else {
+		ssize_t r;
+		char readlink_buffer[MAX_FILENAME_SIZE];
+		snprintf(readlink_buffer, MAX_FILENAME_SIZE, "/proc/self/fd/%d",
+			destination_fd);
+		r = readlink(readlink_buffer, destination_file,
+			max_dest_filename_size);
+		if (r < 0) {
+			/* readlink failed */
+			result = 3;
+			pb_log("%s: failed: unable to obtain temporary filename"
+				"\n", __func__);
+		}
+		destination_file[r] = '\0';
+	}
+
+	fclose(source_handle);
+	fclose(destination_handle);
+
+	return result;
+}
+
+#if defined(HAVE_LIBGPGME)
+static int verify_file_signature(const char * plaintext_filename,
+	const char * signature_filename, FILE * authorized_signatures_handle,
+	const char * keyring_path)
+{
+	int valid = 0;
+
+	if (signature_filename == NULL)
+		return -1;
+
+	gpgme_signature_t verification_signatures;
+	gpgme_verify_result_t verification_result;
+	gpgme_data_t plaintext_data;
+	gpgme_data_t signature_data;
+	gpgme_engine_info_t enginfo;
+	gpgme_ctx_t gpg_context;
+	gpgme_error_t err;
+
+	/* Initialize gpgme */
+	setlocale (LC_ALL, "");
+	gpgme_check_version(NULL);
+	gpgme_set_locale(NULL, LC_CTYPE, setlocale (LC_CTYPE, NULL));
+	err = gpgme_engine_check_version(GPGME_PROTOCOL_OpenPGP);
+	if (err != GPG_ERR_NO_ERROR) {
+		pb_log("%s: OpenPGP support not available\n", __func__);
+		return -1;
+	}
+	err = gpgme_get_engine_info(&enginfo);
+	if (err != GPG_ERR_NO_ERROR) {
+		pb_log("%s: GPG engine failed to initialize\n", __func__);
+		return -1;
+	}
+	err = gpgme_new(&gpg_context);
+	if (err != GPG_ERR_NO_ERROR) {
+		pb_log("%s: GPG context could not be created\n", __func__);
+		return -1;
+	}
+	err = gpgme_set_protocol(gpg_context, GPGME_PROTOCOL_OpenPGP);
+	if (err != GPG_ERR_NO_ERROR) {
+		pb_log("%s: GPG protocol could not be set\n", __func__);
+		return -1;
+	}
+	if (keyring_path)
+		err = gpgme_ctx_set_engine_info (gpg_context,
+			GPGME_PROTOCOL_OpenPGP, enginfo->file_name,
+			keyring_path);
+	else
+		err = gpgme_ctx_set_engine_info (gpg_context,
+			GPGME_PROTOCOL_OpenPGP, enginfo->file_name,
+			enginfo->home_dir);
+	if (err != GPG_ERR_NO_ERROR) {
+		pb_log("%s: Could not set GPG engine information\n", __func__);
+		return -1;
+	}
+	err = gpgme_data_new_from_file(&plaintext_data, plaintext_filename, 1);
+	if (err != GPG_ERR_NO_ERROR) {
+		pb_log("%s: Could not create GPG plaintext data buffer"
+			" from file '%s'\n", __func__, plaintext_filename);
+		return -1;
+	}
+	err = gpgme_data_new_from_file(&signature_data, signature_filename, 1);
+	if (err != GPG_ERR_NO_ERROR) {
+		pb_log("%s: Could not create GPG signature data buffer"
+			" from file '%s'\n", __func__, signature_filename);
+		return -1;
+	}
+
+	/* Check signature */
+	err = gpgme_op_verify(gpg_context, signature_data, plaintext_data,
+		NULL);
+	if (err != GPG_ERR_NO_ERROR) {
+		pb_log("%s: Could not verify file using GPG signature '%s'\n",
+			__func__, signature_filename);
+		return -1;
+	}
+	verification_result = gpgme_op_verify_result(gpg_context);
+	verification_signatures = verification_result->signatures;
+	while (verification_signatures) {
+		if (verification_signatures->status == GPG_ERR_NO_ERROR) {
+			pb_log("%s: Good signature for key ID '%s' ('%s')\n",
+				__func__, verification_signatures->fpr,
+				signature_filename);
+			/* Verify fingerprint is present in
+			 * authorized signatures file
+			 */
+			char *auth_sig_line = NULL;
+			size_t auth_sig_len = 0;
+			ssize_t auth_sig_read;
+			rewind(authorized_signatures_handle);
+			while ((auth_sig_read = getline(&auth_sig_line,
+				&auth_sig_len,
+				authorized_signatures_handle)) != -1) {
+				auth_sig_len = strlen(auth_sig_line);
+				while ((auth_sig_line[auth_sig_len-1] == '\n')
+					|| (auth_sig_line[auth_sig_len-1] == '\r'))
+					auth_sig_len--;
+				auth_sig_line[auth_sig_len] = '\0';
+				if (strcmp(auth_sig_line,
+					verification_signatures->fpr) == 0)
+					valid = 1;
+			}
+			free(auth_sig_line);
+		}
+		else {
+			pb_log("%s: Signature for key ID '%s' ('%s') invalid."
+				"  Status: %08x\n", __func__,
+				verification_signatures->fpr,
+				signature_filename,
+				verification_signatures->status);
+		}
+		verification_signatures = verification_signatures->next;
+	}
+
+	/* Clean up */
+	gpgme_data_release(plaintext_data);
+	gpgme_data_release(signature_data);
+	gpgme_release(gpg_context);
+
+	if (!valid) {
+		pb_log("%s: Incorrect GPG signature\n", __func__);
+		return -1;
+	}
+	else {
+		pb_log("%s: GPG signature '%s' for file '%s' verified\n",
+			__func__, signature_filename, plaintext_filename);
+	}
+
+	return 0;
+}
+#endif
 
 /**
  * kexec_load - kexec load helper.
@@ -57,20 +269,155 @@ static int kexec_load(struct boot_task *boot_task)
 	char *s_dtb = NULL;
 	char *s_args = NULL;
 
+	const char* local_initrd = boot_task->local_initrd;
+	const char* local_dtb = boot_task->local_dtb;
+	const char* local_image = boot_task->local_image;
+
+#if defined(HAVE_LIBGPGME)
+	const char* local_initrd_signature = (boot_task->verify_signature) ?
+		boot_task->local_initrd_signature : NULL;
+	const char* local_dtb_signature = (boot_task->verify_signature) ?
+		boot_task->local_dtb_signature : NULL;
+	const char* local_image_signature = (boot_task->verify_signature) ?
+		boot_task->local_image_signature : NULL;
+	const char* local_cmdline_signature = (boot_task->verify_signature) ?
+		boot_task->local_cmdline_signature : NULL;
+
+	if (boot_task->verify_signature) {
+		char kernel_filename[MAX_FILENAME_SIZE];
+		char initrd_filename[MAX_FILENAME_SIZE];
+		char dtb_filename[MAX_FILENAME_SIZE];
+
+		kernel_filename[0] = '\0';
+		initrd_filename[0] = '\0';
+		dtb_filename[0] = '\0';
+
+		FILE *authorized_signatures_handle = NULL;
+
+		/* Load authorized signatures file */
+		authorized_signatures_handle = fopen(LOCKDOWN_FILE, "r");
+		if (!authorized_signatures_handle) {
+			pb_log("%s: unable to read lockdown file\n", __func__);
+			result = KEXEC_LOAD_SIG_SETUP_INVALID;
+			return result;
+		}
+
+		/* Copy files to temporary directory for verification / boot */
+		result = copy_file_to_destination(boot_task->local_image,
+			kernel_filename, MAX_FILENAME_SIZE);
+		if (result) {
+			pb_log("%s: image copy failed: (%d)\n",
+				__func__, result);
+			return result;
+		}
+		if (boot_task->local_initrd) {
+			result = copy_file_to_destination(
+				boot_task->local_initrd,
+				initrd_filename, MAX_FILENAME_SIZE);
+			if (result) {
+				pb_log("%s: initrd copy failed: (%d)\n",
+					__func__, result);
+				unlink(local_image);
+				return result;
+			}
+		}
+		if (boot_task->local_dtb) {
+			result = copy_file_to_destination(boot_task->local_dtb,
+				dtb_filename, MAX_FILENAME_SIZE);
+			if (result) {
+				pb_log("%s: dtb copy failed: (%d)\n",
+					__func__, result);
+				unlink(local_image);
+				if (local_initrd)
+					unlink(local_initrd);
+				return result;
+			}
+		}
+		local_image = talloc_strdup(boot_task,
+			kernel_filename);
+		if (boot_task->local_initrd)
+			local_initrd = talloc_strdup(boot_task,
+				initrd_filename);
+		if (boot_task->local_dtb)
+			local_dtb = talloc_strdup(boot_task,
+				dtb_filename);
+
+		/* Write command line to temporary file for verification */
+		char cmdline_template[21] = "/tmp/petitbootXXXXXX";
+		int cmdline_fd = mkstemp(cmdline_template);
+		FILE *cmdline_handle = NULL;
+		if (cmdline_fd < 0) {
+			// handle mkstemp error
+			pb_log("%s: failed: unable to create command line"
+				" temporary file for verification\n",
+				__func__);
+			result = -1;
+		}
+		else {
+			cmdline_handle = fdopen(cmdline_fd, "w");
+		}
+		if (!cmdline_handle) {
+			// handle open error
+			pb_log("%s: failed: unable to write command line"
+				" temporary file for verification\n",
+				__func__);
+			result = -1;
+		}
+		else {
+			fwrite(boot_task->args, sizeof(char),
+				strlen(boot_task->args), cmdline_handle);
+			fflush(cmdline_handle);
+		}
+
+		/* Check signatures */
+		if (verify_file_signature(kernel_filename,
+			local_image_signature,
+			authorized_signatures_handle, "/etc/gpg"))
+			result = KEXEC_LOAD_SIGNATURE_FAILURE;
+		if (verify_file_signature(cmdline_template,
+			local_cmdline_signature,
+			authorized_signatures_handle, "/etc/gpg"))
+			result = KEXEC_LOAD_SIGNATURE_FAILURE;
+		if (boot_task->local_initrd_signature)
+			if (verify_file_signature(initrd_filename,
+				local_initrd_signature,
+				authorized_signatures_handle, "/etc/gpg"))
+				result = KEXEC_LOAD_SIGNATURE_FAILURE;
+		if (boot_task->local_dtb_signature)
+			if (verify_file_signature(dtb_filename,
+				local_dtb_signature,
+				authorized_signatures_handle, "/etc/gpg"))
+				result = KEXEC_LOAD_SIGNATURE_FAILURE;
+
+		/* Clean up */
+		if (cmdline_handle) {
+			fclose(cmdline_handle);
+			unlink(cmdline_template);
+		}
+		fclose(authorized_signatures_handle);
+
+		if (result == KEXEC_LOAD_SIGNATURE_FAILURE) {
+			pb_log("%s: Aborting kexec due to"
+				" signature verification failure\n", __func__);
+			goto abort_kexec;
+		}
+	}
+#endif
+
 	p = argv;
 	*p++ = pb_system_apps.kexec;	/* 1 */
 	*p++ = "-l";			/* 2 */
 
-	if (boot_task->local_initrd) {
+	if (local_initrd) {
 		s_initrd = talloc_asprintf(boot_task, "--initrd=%s",
-				boot_task->local_initrd);
+				local_initrd);
 		assert(s_initrd);
 		*p++ = s_initrd;	 /* 3 */
 	}
 
-	if (boot_task->local_dtb) {
+	if (local_dtb) {
 		s_dtb = talloc_asprintf(boot_task, "--dtb=%s",
-						boot_task->local_dtb);
+						local_dtb);
 		assert(s_dtb);
 		*p++ = s_dtb;		 /* 4 */
 	}
@@ -82,13 +429,30 @@ static int kexec_load(struct boot_task *boot_task)
 		*p++ = s_args;		/* 5 */
 	}
 
-	*p++ = boot_task->local_image;	/* 6 */
+	*p++ = local_image;	/* 6 */
 	*p++ = NULL;			/* 7 */
 
 	result = process_run_simple_argv(boot_task, argv);
 
 	if (result)
 		pb_log("%s: failed: (%d)\n", __func__, result);
+
+#if defined(HAVE_LIBGPGME)
+abort_kexec:
+	if (boot_task->verify_signature) {
+		unlink(local_image);
+		if (local_initrd)
+			unlink(local_initrd);
+		if (local_dtb)
+			unlink(local_dtb);
+
+		talloc_free((char*)local_image);
+		if (local_initrd)
+			talloc_free((char*)local_initrd);
+		if (local_dtb)
+			talloc_free((char*)local_dtb);
+	}
+#endif
 
 	return result;
 }
@@ -373,11 +737,44 @@ static void boot_process(struct load_url_result *result, void *data)
 			check_load(task, "dtb", task->dtb))
 		goto no_load;
 
+#if defined(HAVE_LIBGPGME)
+	if (task->verify_signature) {
+		if (load_pending(task->image_signature) ||
+				load_pending(task->initrd_signature) ||
+				load_pending(task->dtb_signature) ||
+				load_pending(task->cmdline_signature))
+			return;
+
+		if (check_load(task, "kernel image signature",
+					task->image_signature) ||
+				check_load(task, "initrd signature",
+					task->initrd_signature) ||
+				check_load(task, "dtb signature",
+					task->dtb_signature) ||
+				check_load(task, "command line signature",
+					task->cmdline_signature))
+			goto no_sig_load;
+	}
+#endif
+
 	/* we make a copy of the local paths, as the boot hooks might update
 	 * and/or create these */
 	task->local_image = task->image ? task->image->local : NULL;
 	task->local_initrd = task->initrd ? task->initrd->local : NULL;
 	task->local_dtb = task->dtb ? task->dtb->local : NULL;
+
+#if defined(HAVE_LIBGPGME)
+	if (task->verify_signature) {
+		task->local_image_signature = task->image_signature ?
+			task->image_signature->local : NULL;
+		task->local_initrd_signature = task->initrd_signature ?
+			task->initrd_signature->local : NULL;
+		task->local_dtb_signature = task->dtb_signature ?
+			task->dtb_signature->local : NULL;
+		task->local_cmdline_signature = task->cmdline_signature ?
+			task->cmdline_signature->local : NULL;
+	}
+#endif
 
 	run_boot_hooks(task);
 
@@ -385,10 +782,27 @@ static void boot_process(struct load_url_result *result, void *data)
 			_("performing kexec_load"));
 
 	rc = kexec_load(task);
-	if (rc) {
+	if (rc == KEXEC_LOAD_SIGNATURE_FAILURE) {
 		update_status(task->status_fn, task->status_arg,
-				BOOT_STATUS_ERROR, _("kexec load failed"));
+				BOOT_STATUS_ERROR,
+				_("signature verification failed"));
 	}
+	else if (rc == KEXEC_LOAD_SIG_SETUP_INVALID) {
+		update_status(task->status_fn, task->status_arg,
+				BOOT_STATUS_ERROR,
+				_("invalid signature configuration"));
+	}
+	else if (rc) {
+		update_status(task->status_fn, task->status_arg,
+				BOOT_STATUS_ERROR,
+				_("kexec load failed"));
+	}
+
+no_sig_load:
+	cleanup_load(task->image_signature);
+	cleanup_load(task->initrd_signature);
+	cleanup_load(task->dtb_signature);
+	cleanup_load(task->cmdline_signature);
 
 no_load:
 	cleanup_load(task->image);
@@ -430,6 +844,8 @@ struct boot_task *boot(void *ctx, struct discover_boot_option *opt,
 		boot_status_fn status_fn, void *status_arg)
 {
 	struct pb_url *image = NULL, *initrd = NULL, *dtb = NULL;
+	struct pb_url *image_sig = NULL, *initrd_sig = NULL, *dtb_sig = NULL,
+		*cmdline_sig = NULL;
 	struct boot_task *boot_task;
 	const char *boot_desc;
 	int rc;
@@ -471,6 +887,14 @@ struct boot_task *boot(void *ctx, struct discover_boot_option *opt,
 	boot_task->dry_run = dry_run;
 	boot_task->status_fn = status_fn;
 	boot_task->status_arg = status_arg;
+#if defined(HAVE_LIBGPGME)
+	if (access(LOCKDOWN_FILE, F_OK) == -1)
+		boot_task->verify_signature = false;
+	else
+		boot_task->verify_signature = true;
+#else
+	boot_task->verify_signature = false;
+#endif
 
 	if (cmd && cmd->boot_args) {
 		boot_task->args = talloc_strdup(boot_task, cmd->boot_args);
@@ -481,10 +905,67 @@ struct boot_task *boot(void *ctx, struct discover_boot_option *opt,
 		boot_task->args = NULL;
 	}
 
+	if (boot_task->verify_signature) {
+		if (cmd && cmd->args_sig_file) {
+			cmdline_sig = pb_url_parse(opt, cmd->args_sig_file);
+		} else if (opt && opt->args_sig_file) {
+			cmdline_sig = opt->args_sig_file->url;
+		} else {
+			pb_log("%s: no command line signature file"
+				" specified\n", __func__);
+			update_status(status_fn, status_arg, BOOT_STATUS_INFO,
+					_("Boot failed: no command line"
+						" signature file specified"));
+			return NULL;
+		}
+	}
+
 	/* start async loads for boot resources */
 	rc = start_url_load(boot_task, "kernel image", image, &boot_task->image)
 	  || start_url_load(boot_task, "initrd", initrd, &boot_task->initrd)
 	  || start_url_load(boot_task, "dtb", dtb, &boot_task->dtb);
+
+	if (boot_task->verify_signature) {
+		/* Generate names of associated signature files and load */
+		if (image) {
+			image_sig = pb_url_copy(ctx, image);
+			talloc_free(image_sig->file);
+			image_sig->file = talloc_asprintf(image_sig,
+				"%s.sig", image->file);
+			talloc_free(image_sig->path);
+			image_sig->path = talloc_asprintf(image_sig,
+				"%s.sig", image->path);
+			rc |= start_url_load(boot_task,
+				"kernel image signature", image_sig,
+				&boot_task->image_signature);
+		}
+		if (initrd) {
+			initrd_sig = pb_url_copy(ctx, initrd);
+			talloc_free(initrd_sig->file);
+			initrd_sig->file = talloc_asprintf(initrd_sig,
+				"%s.sig", initrd->file);
+			talloc_free(initrd_sig->path);
+			initrd_sig->path = talloc_asprintf(initrd_sig,
+				"%s.sig", initrd->path);
+			rc |= start_url_load(boot_task, "initrd signature",
+				initrd_sig, &boot_task->initrd_signature);
+		}
+		if (dtb) {
+			dtb_sig = pb_url_copy(ctx, dtb);
+			talloc_free(dtb_sig->file);
+			dtb_sig->file = talloc_asprintf(dtb_sig,
+				"%s.sig", dtb->file);
+			talloc_free(dtb_sig->path);
+			dtb_sig->path = talloc_asprintf(dtb_sig,
+				"%s.sig", dtb->path);
+			rc |= start_url_load(boot_task, "dtb signature",
+				dtb_sig, &boot_task->dtb_signature);
+		}
+
+		rc |= start_url_load(boot_task,
+			"kernel command line signature", cmdline_sig,
+			&boot_task->cmdline_signature);
+	}
 
 	/* If all URLs are local, we may be done. */
 	if (rc) {

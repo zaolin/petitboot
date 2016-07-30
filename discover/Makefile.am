@@ -56,7 +56,8 @@ discover_pb_discover_LDADD = \
 	discover/grub2/grub2-parser.ro \
 	discover/platform.ro \
 	$(core_lib) \
-	$(UDEV_LIBS)
+	$(UDEV_LIBS) \
+	$(GPGME_LIBS)
 
 discover_pb_discover_CPPFLAGS = \
 	$(AM_CPPFLAGS) \

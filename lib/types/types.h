@@ -36,6 +36,7 @@ struct boot_option {
 	char		*initrd_file;
 	char		*dtb_file;
 	char		*boot_args;
+	char		*args_sig_file;
 	bool		is_default;
 
 	struct list_item	list;
@@ -49,6 +50,7 @@ struct boot_command {
 	char *initrd_file;
 	char *dtb_file;
 	char *boot_args;
+	char *args_sig_file;
 };
 
 struct boot_status {
